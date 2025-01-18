@@ -15,6 +15,7 @@ import tqdm
 import tyro
 import viser
 import yaml
+import open3d as o3d
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
@@ -69,6 +70,8 @@ class Config:
     global_scale: float = 1.0
     # Normalize the world space
     normalize_world_space: bool = True
+    # Masking the images for training
+    masking: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -83,19 +86,19 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
 
     # Initialization strategy
-    init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
+    init_type: Literal["sfm", "lidar", "sfm+lidar", "random"] = "sfm"
+    # Initial number of GSs. Ignored if using sfm or lidar options
     init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm or lidar options
     init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
@@ -129,6 +132,9 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
+    # Fix the position of LiDAR input points
+    fix_lidar: bool = False
+    
     # Opacity regularization
     opacity_reg: float = 0.0
     # Scale regularization
@@ -207,9 +213,15 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
+    if init_type == "sfm" or init_type == "lidar" or init_type == "sfm+lidar":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        lidar_points_num = parser.lidar_points_num
+        # # For Debugging
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(points.numpy())
+        # pcd.colors = o3d.utility.Vector3dVector(rgbs.numpy())
+        # o3d.io.write_point_cloud("./input.ply", pcd)
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -222,9 +234,39 @@ def create_splats_with_optimizers(
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    if init_type == "lidar" or init_type == "sfm+lidar":        
+        lidar_points_num_per_rank = lidar_points_num // world_size
+        sfm_points_num_per_rank = (points.shape[0] - lidar_points_num) // world_size
+
+        # Separate lidar and sfm points
+        lidar_points = points[:lidar_points_num]
+        sfm_points = points[lidar_points_num:]
+
+        lidar_rgbs = rgbs[:lidar_points_num]
+        sfm_rgbs = rgbs[lidar_points_num:]
+
+        lidar_scales = scales[:lidar_points_num]
+        sfm_scales = scales[lidar_points_num:]
+
+        # Distribute the points, rgbs, scales to different ranks
+        points = torch.cat([
+            lidar_points[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
+            sfm_points[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
+        ], dim=0)
+
+        rgbs = torch.cat([
+            lidar_rgbs[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
+            sfm_rgbs[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
+        ], dim=0)
+
+        scales = torch.cat([
+            lidar_scales[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
+            sfm_scales[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
+        ], dim=0)
+    else:
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
@@ -235,7 +277,7 @@ def create_splats_with_optimizers(
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ("opacities", torch.nn.Parameter(opacities), 1e-2), # 5e-2
     ]
 
     if feature_dim is None:
@@ -311,7 +353,9 @@ class Runner:
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
+            masking=cfg.masking,
             test_every=cfg.test_every,
+            init_type=cfg.init_type,
         )
         self.trainset = Dataset(
             self.parser,
@@ -762,6 +806,10 @@ class Runner:
 
                 save_ply(self.splats, f"{self.ply_dir}/point_cloud_{step}.ply", rgb)
 
+            # Fix the position of LiDAR input points
+            if cfg.fix_lidar:
+                self.splats["means"].grad[:(self.parser.lidar_points_num // self.world_size)] = 0.0
+                
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
