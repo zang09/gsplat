@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
+import glob
 import viser
 
 from gsplat._helper import load_test_data
@@ -107,7 +108,14 @@ def main(local_rank: int, world_rank, world_size: int, args):
         )
     else:
         means, quats, scales, opacities, sh0, shN = [], [], [], [], [], []
+        if os.path.isdir(args.ckpt[0]):
+            args.ckpt = sorted(glob.glob(os.path.join(args.ckpt[0], "*.pt")))
+            ckpt_numbers = [int(os.path.basename(ckpt).split('_')[1]) for ckpt in args.ckpt]
+            max_ckpt_number = max(ckpt_numbers)
+            args.ckpt = [ckpt for ckpt in args.ckpt if str(max_ckpt_number) in ckpt]
+        
         for ckpt_path in args.ckpt:
+            print("Loading", ckpt_path)
             ckpt = torch.load(ckpt_path, map_location=device)["splats"]
             means.append(ckpt["means"])
             quats.append(F.normalize(ckpt["quats"], p=2, dim=-1))
