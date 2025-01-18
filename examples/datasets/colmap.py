@@ -219,11 +219,19 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
+        mask_files = sorted(_get_rel_paths(mask_dir)) if os.path.exists(mask_dir) else None
         if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
             image_dir = _resize_image_folder(
                 colmap_image_dir, image_dir + "_png", factor=factor
             )
             image_files = sorted(_get_rel_paths(image_dir))
+            if mask_files:
+                mask_dir = _resize_image_folder(
+                    os.path.join(data_dir, "masks"),
+                    mask_dir + "_png",
+                    factor=factor,
+                )
+                mask_files = sorted(_get_rel_paths(mask_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         colmap_to_mask = dict(zip(colmap_files, mask_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
