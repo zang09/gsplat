@@ -9,6 +9,7 @@ from PIL import Image
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import open3d as o3d
 from pycolmap import SceneManager
 
 from .normalize import (
@@ -61,13 +62,40 @@ class Parser:
         data_dir: str,
         factor: int = 1,
         normalize: bool = False,
+        masking: bool = False,
         test_every: int = 8,
+        init_type: str = "sfm",
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
 
+        self.lidar_mode = True
+        lidar_path = os.path.join(data_dir, "lidar", "colorized_pc.ply")
+        if not os.path.exists(lidar_path):
+            lidar_path = os.path.join(data_dir, "lidar", "pc.ply")
+            if not os.path.exists(lidar_path):
+                self.lidar_mode = False
+        
+        L2C = np.array([
+                [0, -1, 0, 0],
+                [0, 0, -1, 0],
+                [1, 0, 0, 0],
+                [0, 0, 0, 1]
+            ])
+        
+        if self.lidar_mode:
+            pcd = o3d.io.read_point_cloud(lidar_path)
+            pcd = pcd.voxel_down_sample(voxel_size=0.1)
+            # Convert LiDAR coordinates to camera coordinates.            
+            pcd.transform(L2C)
+            lidar_points = np.asarray(pcd.points)
+            lidar_colors = np.asarray(pcd.colors)
+            print(f"[Parser] {len(lidar_points)} points load from the LiDAR pointcloud.")
+        else:
+            print(f"[Parser] No LiDAR pointcloud found in {lidar_path}.")
+        
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
@@ -182,6 +210,7 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        mask_dir = os.path.join(data_dir, "masks" + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -196,12 +225,18 @@ class Parser:
             )
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
+        colmap_to_mask = dict(zip(colmap_files, mask_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
-
+        if masking and os.path.exists(mask_dir):
+            mask_paths = [os.path.join(mask_dir, colmap_to_mask[f]) for f in image_names]
+        else:
+            mask_paths = None
+        
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
+        # points_err = manager.point3D_errors.astype(np.float32)
         points_rgb = manager.point3D_colors.astype(np.uint8)
+        print(f"[Parser] {len(points)} load from SfM points.")
         point_indices = dict()
 
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
@@ -214,6 +249,17 @@ class Parser:
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
 
+        if init_type == "lidar":
+            points = lidar_points
+            points_rgb = lidar_colors
+            self.lidar_points_num = len(lidar_points)
+        elif init_type == "sfm+lidar":
+            points = np.concatenate([lidar_points, points], axis=0)
+            points_rgb = np.concatenate([lidar_colors, points_rgb], axis=0)
+            self.lidar_points_num = len(lidar_points)
+        else:
+            self.lidar_points_num = 0
+        
         # Normalize the world space.
         if normalize:
             T1 = similarity_from_cameras(camtoworlds)
@@ -230,6 +276,7 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.mask_paths = mask_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -237,7 +284,7 @@ class Parser:
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
         self.mask_dict = mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
-        self.points_err = points_err  # np.ndarray, (num_points,)
+        # self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
@@ -357,11 +404,14 @@ class Dataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        mask = imageio.imread(self.parser.mask_paths[index], mode='L') if self.parser.mask_paths else None
+        if mask is not None:
+            image = image * (mask[..., None] > 0)
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        # mask = self.parser.mask_dict[camera_id]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -429,7 +479,8 @@ if __name__ == "__main__":
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir, factor=args.factor, \
+        normalize=True, masking=False, test_every=8, init_type="sfm"
     )
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")
