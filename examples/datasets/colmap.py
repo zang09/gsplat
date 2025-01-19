@@ -384,13 +384,22 @@ class Parser:
             T1 = similarity_from_cameras(camtoworlds)
             camtoworlds = transform_cameras(T1, camtoworlds)
             points = transform_points(T1, points)
+            
+            T2 = align_principle_axes(points)
+            camtoworlds = transform_cameras(T2, camtoworlds)
+            points = transform_points(T2, points)
 
-            # T2 = align_principle_axes(points)
-            # camtoworlds = transform_cameras(T2, camtoworlds)
-            # points = transform_points(T2, points)
-
-            # transform = T2 @ T1
-            transform = T1
+            # For haedong
+            T3 = np.array([
+                [1, 0, 0, 0],
+                [0, -1, 0, 0],
+                [0, 0, -1, 0],
+                [0, 0, 0, 1]
+            ])
+            camtoworlds = transform_cameras(T3, camtoworlds)
+            points = transform_points(T3, points)
+            
+            transform = T3 @ T2 @ T1
         else:
             transform = np.eye(4)
 
