@@ -72,6 +72,8 @@ class Config:
     normalize_world_space: bool = True
     # Masking the images for training
     masking: bool = False
+    # Chunk option for the dataset
+    chunk: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -86,13 +88,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000, 60_000, 100_000, 300_000, 600_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000, 60_000, 100_000, 300_000, 600_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = True
+    save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000, 100_000, 300_000, 600_000])
+    ply_steps: List[int] = field(default_factory=lambda: [30_000, 60_000, 100_000, 300_000, 600_000])
 
     # Initialization strategy
     init_type: Literal["sfm", "lidar", "sfm+lidar", "random"] = "sfm"
@@ -217,11 +219,13 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
         lidar_points_num = parser.lidar_points_num
-        # # For Debugging
+        # ## For Debugging ##
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(points.numpy())
         # pcd.colors = o3d.utility.Vector3dVector(rgbs.numpy())
         # o3d.io.write_point_cloud("./input.ply", pcd)
+        # print("[DEBUG] Input points saved to input.ply")
+        # ##################
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -354,6 +358,7 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             masking=cfg.masking,
+            chunk=cfg.chunk,
             test_every=cfg.test_every,
             init_type=cfg.init_type,
         )

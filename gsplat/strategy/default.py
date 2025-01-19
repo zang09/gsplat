@@ -76,7 +76,7 @@ class DefaultStrategy(Strategy):
 
     """
 
-    prune_opa: float = 0.05 # 0.005
+    prune_opa: float = 0.005 # 0.005
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05

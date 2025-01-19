@@ -63,6 +63,7 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         masking: bool = False,
+        chunk: bool = False,
         test_every: int = 8,
         init_type: str = "sfm",
     ):
@@ -72,7 +73,7 @@ class Parser:
         self.test_every = test_every
 
         self.lidar_mode = True
-        lidar_path = os.path.join(data_dir, "lidar", "colorized_pc.ply")
+        lidar_path = os.path.join(data_dir, "lidar", "colorized_pc_0.1.ply")
         if not os.path.exists(lidar_path):
             lidar_path = os.path.join(data_dir, "lidar", "pc.ply")
             if not os.path.exists(lidar_path):
@@ -87,7 +88,8 @@ class Parser:
         
         if self.lidar_mode:
             pcd = o3d.io.read_point_cloud(lidar_path)
-            pcd = pcd.voxel_down_sample(voxel_size=0.1)
+            # pcd = pcd.voxel_down_sample(voxel_size=0.1)
+            # o3d.io.write_point_cloud(os.path.join(data_dir, "lidar", "colorized_pc_0.1.ply"), pcd)
             # Convert LiDAR coordinates to camera coordinates.            
             pcd.transform(L2C)
             lidar_points = np.asarray(pcd.points)
@@ -96,89 +98,189 @@ class Parser:
         else:
             print(f"[Parser] No LiDAR pointcloud found in {lidar_path}.")
         
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
-        assert os.path.exists(
-            colmap_dir
-        ), f"COLMAP directory {colmap_dir} does not exist."
+        if chunk:
+            colmap_chunk_dir = os.path.join(data_dir, "chunks")
+            colmap_chunk_dirs = sorted([os.path.join(colmap_chunk_dir, d) for d in os.listdir(colmap_chunk_dir)])
+            print(f"[Parser] {len(colmap_chunk_dirs)} chunks found in {colmap_chunk_dir}.")
+                        
+            w2c_mats = []
+            camera_ids = []
+            Ks_dict = dict()
+            params_dict = dict()
+            imsize_dict = dict()
+            mask_dict = dict()
+            image_names = []
+            
+            for colmap_chunk_dir in colmap_chunk_dirs:
+                chunk_number = int(colmap_chunk_dir.split("/")[-1].split('_')[-1])
+                # if chunk_number < 6 or chunk_number > 10:
+                #     continue
+                if chunk_number == 4 or chunk_number == 13:
+                    continue
+                print(f"[Parser] Processing chunk {chunk_number}...")
+                
+                colmap_dir = os.path.join(colmap_chunk_dir, "sparse/0/")
+                if not os.path.exists(colmap_dir):
+                    colmap_dir = os.path.join(colmap_chunk_dir, "sparse")
+                assert os.path.exists(
+                    colmap_dir
+                ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
-        manager.load_cameras()
-        manager.load_images()
-        manager.load_points3D()
+                manager = SceneManager(colmap_dir)
+                manager.load_cameras()
+                manager.load_images()
+                manager.load_points3D()
 
-        # Extract extrinsic matrices in world-to-camera format.
-        imdata = manager.images
-        w2c_mats = []
-        camera_ids = []
-        Ks_dict = dict()
-        params_dict = dict()
-        imsize_dict = dict()  # width, height
-        mask_dict = dict()
-        bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
-        for k in imdata:
-            im = imdata[k]
-            rot = im.R()
-            trans = im.tvec.reshape(3, 1)
-            w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
-            w2c_mats.append(w2c)
+                # Extract extrinsic matrices in world-to-camera format.
+                imdata = manager.images
 
-            # support different camera intrinsics
-            camera_id = im.camera_id
-            camera_ids.append(camera_id)
+                for k in imdata:
+                    im = imdata[k]
+                    rot = im.R()
+                    trans = im.tvec.reshape(3, 1)
+                    bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+                    w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+                    w2c_mats.append(w2c)
 
-            # camera intrinsics
-            cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
-            Ks_dict[camera_id] = K
+                    # support different camera intrinsics
+                    camera_id = im.camera_id
+                    camera_ids.append(camera_id)
 
-            # Get distortion parameters.
-            type_ = cam.camera_type
-            if type_ == 0 or type_ == "SIMPLE_PINHOLE":
-                params = np.empty(0, dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 1 or type_ == "PINHOLE":
-                params = np.empty(0, dtype=np.float32)
-                camtype = "perspective"
-            if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 3 or type_ == "RADIAL":
-                params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 4 or type_ == "OPENCV":
-                params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 5 or type_ == "OPENCV_FISHEYE":
-                params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
-                camtype = "fisheye"
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+                    # camera intrinsics
+                    cam = manager.cameras[camera_id]
+                    fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+                    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+                    K[:2, :] /= factor
+                    Ks_dict[camera_id] = K
 
-            params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
-        print(
-            f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
-        )
+                    # Get distortion parameters.
+                    type_ = cam.camera_type
+                    if type_ == 0 or type_ == "SIMPLE_PINHOLE":
+                        params = np.empty(0, dtype=np.float32)
+                        camtype = "perspective"
+                    elif type_ == 1 or type_ == "PINHOLE":
+                        params = np.empty(0, dtype=np.float32)
+                        camtype = "perspective"
+                    if type_ == 2 or type_ == "SIMPLE_RADIAL":
+                        params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
+                        camtype = "perspective"
+                    elif type_ == 3 or type_ == "RADIAL":
+                        params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
+                        camtype = "perspective"
+                    elif type_ == 4 or type_ == "OPENCV":
+                        params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
+                        camtype = "perspective"
+                    elif type_ == 5 or type_ == "OPENCV_FISHEYE":
+                        params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
+                        camtype = "fisheye"
+                    assert (
+                        camtype == "perspective" or camtype == "fisheye"
+                    ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
-        if len(imdata) == 0:
-            raise ValueError("No images found in COLMAP.")
-        if not (type_ == 0 or type_ == 1):
-            print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
+                    params_dict[camera_id] = params
+                    imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+                    mask_dict[camera_id] = None
+                print(
+                    f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
+                )
 
-        w2c_mats = np.stack(w2c_mats, axis=0)
+                if len(imdata) == 0:
+                    raise ValueError("No images found in COLMAP.")
+                if not (type_ == 0 or type_ == 1):
+                    print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
-        # Convert extrinsics to camera-to-world.
-        camtoworlds = np.linalg.inv(w2c_mats)
+                # Image names from COLMAP. No need for permuting the poses according to image names anymore.
+                image_names.extend([imdata[k].name for k in imdata])
+            
+            w2c_mats = np.stack(w2c_mats, axis=0)
 
-        # Image names from COLMAP. No need for permuting the poses according to
-        # image names anymore.
-        image_names = [imdata[k].name for k in imdata]
+            # Convert extrinsics to camera-to-world.
+            camtoworlds = np.linalg.inv(w2c_mats)
+
+        else:            
+            colmap_dir = os.path.join(data_dir, "sparse/0/")
+            if not os.path.exists(colmap_dir):
+                colmap_dir = os.path.join(data_dir, "sparse")
+            assert os.path.exists(
+                colmap_dir
+            ), f"COLMAP directory {colmap_dir} does not exist."
+
+            manager = SceneManager(colmap_dir)
+            manager.load_cameras()
+            manager.load_images()
+            manager.load_points3D()
+
+            # Extract extrinsic matrices in world-to-camera format.
+            imdata = manager.images
+            w2c_mats = []
+            camera_ids = []
+            Ks_dict = dict()
+            params_dict = dict()
+            imsize_dict = dict()  # width, height
+            mask_dict = dict()
+            bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+            for k in imdata:
+                im = imdata[k]
+                rot = im.R()
+                trans = im.tvec.reshape(3, 1)
+                w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+                w2c_mats.append(w2c)
+
+                # support different camera intrinsics
+                camera_id = im.camera_id
+                camera_ids.append(camera_id)
+
+                # camera intrinsics
+                cam = manager.cameras[camera_id]
+                fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+                K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+                K[:2, :] /= factor
+                Ks_dict[camera_id] = K
+
+                # Get distortion parameters.
+                type_ = cam.camera_type
+                if type_ == 0 or type_ == "SIMPLE_PINHOLE":
+                    params = np.empty(0, dtype=np.float32)
+                    camtype = "perspective"
+                elif type_ == 1 or type_ == "PINHOLE":
+                    params = np.empty(0, dtype=np.float32)
+                    camtype = "perspective"
+                if type_ == 2 or type_ == "SIMPLE_RADIAL":
+                    params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
+                    camtype = "perspective"
+                elif type_ == 3 or type_ == "RADIAL":
+                    params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
+                    camtype = "perspective"
+                elif type_ == 4 or type_ == "OPENCV":
+                    params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
+                    camtype = "perspective"
+                elif type_ == 5 or type_ == "OPENCV_FISHEYE":
+                    params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
+                    camtype = "fisheye"
+                assert (
+                    camtype == "perspective" or camtype == "fisheye"
+                ), f"Only perspective and fisheye cameras are supported, got {type_}"
+
+                params_dict[camera_id] = params
+                imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+                mask_dict[camera_id] = None
+            print(
+                f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
+            )
+
+            if len(imdata) == 0:
+                raise ValueError("No images found in COLMAP.")
+            if not (type_ == 0 or type_ == 1):
+                print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
+
+            w2c_mats = np.stack(w2c_mats, axis=0)
+
+            # Convert extrinsics to camera-to-world.
+            camtoworlds = np.linalg.inv(w2c_mats)
+
+            # Image names from COLMAP. No need for permuting the poses according to
+            # image names anymore.
+            image_names = [imdata[k].name for k in imdata]
 
         # Previous Nerf results were generated with images sorted by filename,
         # ensure metrics are reported on the same test set.
@@ -220,6 +322,7 @@ class Parser:
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
         mask_files = sorted(_get_rel_paths(mask_dir)) if os.path.exists(mask_dir) else None
+        
         if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
             image_dir = _resize_image_folder(
                 colmap_image_dir, image_dir + "_png", factor=factor
@@ -240,23 +343,31 @@ class Parser:
         else:
             mask_paths = None
         
-        # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        # points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
-        print(f"[Parser] {len(points)} load from SfM points.")
-        point_indices = dict()
+        # # 3D points and {image_name -> [point_idx]}
+        # points = manager.points3D.astype(np.float32)
+        # # points_err = manager.point3D_errors.astype(np.float32)
+        # points_rgb = manager.point3D_colors.astype(np.uint8)
+        # print(f"[Parser] {len(points)} load from SfM points.")
+        # point_indices = dict()
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
-        point_indices = {
-            k: np.array(v).astype(np.int32) for k, v in point_indices.items()
-        }
-
+        # image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
+        # for point_id, data in manager.point3D_id_to_images.items():
+        #     for image_id, _ in data:
+        #         image_name = image_id_to_name[image_id]
+        #         point_idx = manager.point3D_id_to_point3D_idx[point_id]
+        #         point_indices.setdefault(image_name, []).append(point_idx)
+        # point_indices = {
+        #     k: np.array(v).astype(np.int32) for k, v in point_indices.items()
+        # }
+        
+        # Temporarily (for haedong)
+        sfm_path = os.path.join(data_dir, "sfm", "points3D_cropped_mapped.ply")
+        pcd = o3d.io.read_point_cloud(sfm_path)
+        pcd.transform(L2C)
+        points = np.asarray(pcd.points)
+        points_rgb = np.asarray(pcd.colors)
+        print(f"[Parser] {len(points)} points load from SfM.")
+        
         if init_type == "lidar":
             points = lidar_points
             points_rgb = lidar_colors
@@ -274,11 +385,12 @@ class Parser:
             camtoworlds = transform_cameras(T1, camtoworlds)
             points = transform_points(T1, points)
 
-            T2 = align_principle_axes(points)
-            camtoworlds = transform_cameras(T2, camtoworlds)
-            points = transform_points(T2, points)
+            # T2 = align_principle_axes(points)
+            # camtoworlds = transform_cameras(T2, camtoworlds)
+            # points = transform_points(T2, points)
 
-            transform = T2 @ T1
+            # transform = T2 @ T1
+            transform = T1
         else:
             transform = np.eye(4)
 
@@ -294,7 +406,7 @@ class Parser:
         self.points = points  # np.ndarray, (num_points, 3)
         # self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
-        self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
+        # self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
