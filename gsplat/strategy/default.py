@@ -331,7 +331,8 @@ class DefaultStrategy(Strategy):
             if step < self.refine_scale2d_stop_iter:
                 is_too_big |= state["radii"] > self.prune_scale2d
 
-            is_prune = is_prune | is_too_big
+            # is_prune = is_prune | is_too_big
+        # is_prune[]
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:

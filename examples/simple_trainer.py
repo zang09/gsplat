@@ -219,6 +219,7 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
         lidar_points_num = parser.lidar_points_num
+        sky_points_num = parser.sky_points_num
         # ## For Debugging ##
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(points.numpy())
@@ -238,32 +239,39 @@ def create_splats_with_optimizers(
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
-    if init_type == "lidar" or init_type == "sfm+lidar":        
+    if init_type == "lidar" or init_type == "sfm+lidar":
+        sky_points_num_per_rank = sky_points_num // world_size        
         lidar_points_num_per_rank = lidar_points_num // world_size
-        sfm_points_num_per_rank = (points.shape[0] - lidar_points_num) // world_size
+        sfm_points_num_per_rank = (points.shape[0] - (sky_points_num + lidar_points_num)) // world_size
 
         # Separate lidar and sfm points
-        lidar_points = points[:lidar_points_num]
-        sfm_points = points[lidar_points_num:]
+        sky_points = points[:sky_points_num]
+        lidar_points = points[sky_points_num:sky_points_num+lidar_points_num]
+        sfm_points = points[sky_points_num+lidar_points_num:]
 
-        lidar_rgbs = rgbs[:lidar_points_num]
-        sfm_rgbs = rgbs[lidar_points_num:]
+        sky_rgbs = rgbs[:sky_points_num]
+        lidar_rgbs = rgbs[sky_points_num:sky_points_num+lidar_points_num]
+        sfm_rgbs = rgbs[sky_points_num+lidar_points_num:]
 
-        lidar_scales = scales[:lidar_points_num]
-        sfm_scales = scales[lidar_points_num:]
+        sky_scales = scales[:sky_points_num]
+        lidar_scales = scales[sky_points_num:sky_points_num+lidar_points_num]
+        sfm_scales = scales[sky_points_num+lidar_points_num:]
 
         # Distribute the points, rgbs, scales to different ranks
         points = torch.cat([
+            sky_points[world_rank * sky_points_num_per_rank:(world_rank + 1) * sky_points_num_per_rank],
             lidar_points[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
             sfm_points[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
         ], dim=0)
 
         rgbs = torch.cat([
+            sky_rgbs[world_rank * sky_points_num_per_rank:(world_rank + 1) * sky_points_num_per_rank],
             lidar_rgbs[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
             sfm_rgbs[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
         ], dim=0)
 
         scales = torch.cat([
+            sky_scales[world_rank * sky_points_num_per_rank:(world_rank + 1) * sky_points_num_per_rank],
             lidar_scales[world_rank * lidar_points_num_per_rank:(world_rank + 1) * lidar_points_num_per_rank],
             sfm_scales[world_rank * sfm_points_num_per_rank:(world_rank + 1) * sfm_points_num_per_rank]
         ], dim=0)
@@ -274,8 +282,14 @@ def create_splats_with_optimizers(
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
+    # breakpoint()
+    opacities = torch.cat([
+        torch.logit(torch.full((sky_points_num_per_rank,), init_opacity)),  # [N,]
+        torch.logit(torch.full((lidar_points_num_per_rank,), init_opacity)),  # [N,]
+        torch.logit(torch.full((sfm_points_num_per_rank,), init_opacity)),  # [N,]
+    ])
+    # opacities = torch.cat([opacities_sky, opacities_lidar, opacities_sfm])
+ 
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
@@ -813,7 +827,8 @@ class Runner:
 
             # Fix the position of LiDAR input points
             if cfg.fix_lidar:
-                self.splats["means"].grad[:(self.parser.lidar_points_num // self.world_size)] = 0.0
+                sky_num = (self.parser.sky_points_num // self.world_size)
+                self.splats["means"].grad[sky_num: sky_num+(self.parser.lidar_points_num // self.world_size)] = 0.0
                 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:

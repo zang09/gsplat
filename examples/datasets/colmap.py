@@ -379,6 +379,28 @@ class Parser:
         else:
             self.lidar_points_num = 0
         
+        # sky points
+        sky_points = 100_000
+        min_point = np.min(points, axis=0)
+        max_point = np.max(points, axis=0)
+        mean_pos = 0.5 * (min_point + max_point)
+
+        radius = np.linalg.norm(max_point - mean_pos)
+
+        # theta = (2.0 * torch.pi * torch.rand(sky_points, device="cuda")).float()
+        theta = (2.0 * np.pi * np.random.rand(sky_points))
+        phi = (np.arccos(1.0 - 1.4 * np.random.rand(sky_points)))
+        sky_xyz = np.zeros((sky_points, 3))
+        sky_xyz[:, 0] = radius * 10 * np.cos(theta)*np.sin(phi) * 0.2
+        sky_xyz[:, 1] = radius * 10 * np.sin(theta)*np.sin(phi) * 0.2
+        sky_xyz[:, 2] = radius * 10 * np.cos(phi) * 0.2
+        sky_xyz += mean_pos
+        sky_xyz = sky_xyz @ L2C[:3, :3].T
+        points = np.vstack((sky_xyz, points))
+        sky_rgb = np.tile(np.array([[135, 206, 235]]), (sky_points, 1)) # Sky RGB = (135, 206, 235)
+        points_rgb = np.concatenate([sky_rgb, points_rgb], axis=0)
+        self.sky_points_num = sky_points
+
         # Normalize the world space.
         if normalize:
             T1 = similarity_from_cameras(camtoworlds)
@@ -400,6 +422,7 @@ class Parser:
             points = transform_points(T3, points)
             
             transform = T3 @ T2 @ T1
+            # transform = T2 @ T1
         else:
             transform = np.eye(4)
 
